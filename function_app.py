@@ -8,9 +8,9 @@ from PyPDF2 import PdfReader
 from json import loads, dumps
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
+import requests
 import io
 import os
-
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
@@ -38,19 +38,23 @@ def scandrive(req: func.HttpRequest) -> func.HttpResponse:
 @app.route(route="scandrive/scan", methods=['POST'])
 def scan_drive(req: func.HttpRequest) -> func.HttpResponse:
     request = req.get_json()
+    backup_req = request
+    request = request['stepData']
     creds = Credentials.from_service_account_file('client_secrets.json')
 
     service = build('drive', 'v3', credentials=creds)
     logging.warning("service done")
     folder_dict = {
         'purchase_orders': request['purchase_orders'],
-        'invoices': request['invoices']
+        'invoices': request['invoices'],
+        'scanned_POs': request['scanned_POs'],
+        'scanned_invoices': request['scanned_invoices']
     }
 
-    scanned_folder_dict = {
-        'scanned_POs':'14z_LSXbYjZNluTJ_n_FZwaaDJN51W3gc',
-        'scanned_invoices':'13N5GXgyXKzX5gW2wr1uaQaio0_0WVJje'
-    }
+    # scanned_folder_dict = {
+    #     'scanned_POs':'14z_LSXbYjZNluTJ_n_FZwaaDJN51W3gc',
+    #     'scanned_invoices':'13N5GXgyXKzX5gW2wr1uaQaio0_0WVJje'
+    # }
 
     logging.warning("folder dict done")
     results = service.files().list(q=f"'{folder_dict['purchase_orders']}' in parents").execute()
@@ -67,38 +71,45 @@ def scan_drive(req: func.HttpRequest) -> func.HttpResponse:
     # items_invoices = filter_pdf_items(items_invoices)
     logging.warning("inv items")
 
+    path = "/tmp/temp.pdf"
+
     def download_file(file_id, mime_type):
         request = None
         fh = io.BytesIO()
         
         # Check if the file is a Google Docs Editors file
-        if mime_type.startswith('application/vnd.google-apps.'):
-            # Choose a compatible export MIME type
-            if mime_type == 'application/vnd.google-apps.document':
-                export_mime_type = 'application/pdf'  # Export Google Docs as PDF
-                request = service.files().export_media(fileId=file_id, mimeType=export_mime_type)
-            # Add more conditions for other Google Docs Editors types if necessary
-        else:
-            # For binary files, use the get_media method
-            request = service.files().get_media(fileId=file_id)
-        
-        if request:
-            downloader = MediaIoBaseDownload(fh, request)
-            done = False
-            while done is False:
-                status, done = downloader.next_chunk()
-            fh.seek(0)
+        try:
+            if mime_type.startswith('application/vnd.google-apps.'):
+                # Choose a compatible export MIME type
+                if mime_type == 'application/vnd.google-apps.document':
+                    export_mime_type = 'application/pdf'  # Export Google Docs as PDF
+                    request = service.files().export_media(fileId=file_id, mimeType=export_mime_type)
+                # Add more conditions for other Google Docs Editors types if necessary
+            else:
+                # For binary files, use the get_media method
+                request = service.files().get_media(fileId=file_id)
+            
+            if request:
+                downloader = MediaIoBaseDownload(fh, request)
+                done = False
+                while done is False:
+                    status, done = downloader.next_chunk()
+                fh.seek(0)
 
-            with open('temp.pdf', 'wb') as f:
-                f.write(fh.read())
-            return 1
+                with open(path, 'wb') as f:
+                    f.write(fh.read())
+                return 1
+        except Exception as e:
+            logging.error("Error downloading file")
+            logging.error(e)
+            return 0
         else:
             return None
 
     def move_file_to_folder(service, file_id, new_parent_id):
         """Move a file to a new folder by changing its parent."""
         # Retrieve the existing parents to remove
-        print("moving file")
+        logging.info("moving file")
         file = service.files().get(fileId=file_id, fields='parents').execute()
         previous_parents = ",".join(file.get('parents'))
         # Move the file to the new folder
@@ -109,12 +120,11 @@ def scan_drive(req: func.HttpRequest) -> func.HttpResponse:
             fields='id, parents'
         ).execute()
         
-
-    def read_files_from_folder(items, scanned_folder):
+    def read_files_from_folder(items, scanned_folder, file_type):
         for item in items:
             f = download_file(item['id'], item['mimeType'])
             if f == 1:
-                with open('temp.pdf', 'rb') as f:
+                with open(path, 'rb') as f:
                     reader = PdfReader(f)
                     text = ""
                     for page in reader.pages:
@@ -122,13 +132,34 @@ def scan_drive(req: func.HttpRequest) -> func.HttpResponse:
 
                     """  text should act as a payload   """
                     print(text)
-                    move_file_to_folder(service, item['id'], scanned_folder)
                     
-                
-
-    read_files_from_folder(items_purchase_orders, scanned_folder_dict['scanned_POs'])
-    read_files_from_folder(items_invoices, scanned_folder_dict['scanned_invoices'])
-    dumps({'status': 'success'})
+                    manual_data = {
+                        'flow' : backup_req['flow'],
+                        'index' : backup_req['index'],
+                        'errors' : backup_req['errors'],
+                        'documentType': file_type,
+                        'extractedText': text
+                    }
+                    try:
+                        url = "https://smartaiplsapifunctions.azurewebsites.net/api/driveupload"
+                        response = requests.post(url, json=manual_data)
+                        logging.info(response.json())
+                        try:
+                            move_file_to_folder(service, item['id'], scanned_folder)
+                        except Exception as e:
+                            logging.error("Error moving file")
+                            logging.error(e)
+                    except Exception as e:
+                        logging.error("Error in func calling file")
+                        logging.error(e)
+                os.remove(path)
+    try:           
+        read_files_from_folder(items_purchase_orders, folder_dict['scanned_POs'], 'PurchaseOrder')
+        read_files_from_folder(items_invoices, folder_dict['scanned_invoices'], 'Invoice')
+    except Exception as e:
+        logging.error("Error in reading files")
+        logging.error(e)
+        return dumps({'status': 'Error in reading files'})
+    # dumps({'status': 'success'})
     
     return dumps({'status': 'success'})
-    

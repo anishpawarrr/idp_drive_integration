@@ -1,0 +1,18 @@
+req_body:
+    flow
+    index
+    errors
+    stepData
+        purchase_orders
+        invoices
+        scanned_POs
+        scanned_invoices
+    
+-------------------------
+
+req_body:
+    flow
+    index
+    errors
+    documentType
+    extractedText
